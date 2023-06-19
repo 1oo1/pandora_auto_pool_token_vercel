@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from os import getenv
 import json
-from flask import Flask
+from flask import Flask, request
 from pandora.openai.auth import Auth0
 import requests
 import redis
@@ -15,9 +15,15 @@ T_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 R_PK = 'pk'
 R_PK_FKS = 'pk_fks'
+R_REFRESH_PK = 'refresh_pk'
+
+redis_url = getenv('KV_URL', '')
+api_auth = getenv('API_AUTH_KEY', '')
+open_ai_accounts = getenv('OPEN_AI_ACCOUNTS', '')
+fk_unique_name = getenv('FK_UNIQUE_NAME', '')
 
 
-def create_redis_from_url(redis_url):
+def create_redis_from_url():
     """Create a Redis client object from a URL."""
     # Parse the URL
     url = urlparse(redis_url)
@@ -34,11 +40,11 @@ def create_redis_from_url(redis_url):
 
 
 # init redis
-r = create_redis_from_url(getenv('KV_URL', ''))
+r = create_redis_from_url()
 
 
-def refresh_fk(credentials_str='', unique_name=''):
-    """Refresh fk: login and convert access token to share token"""
+def register_fk(credentials_str='', unique_name=''):
+    """Register fk: login and convert access token to share token"""
 
     # split with ; to get multiple credentials
     credentials = credentials_str.split(';')
@@ -57,7 +63,7 @@ def refresh_fk(credentials_str='', unique_name=''):
         print(f'Login begin: {username}, {progress}')
 
         token_info = {
-            username: username,
+            'username': username,
             'timestamp': datetime.utcnow().strftime(T_FORMAT),
             'token': 'None',
             'share_token': 'None',
@@ -96,18 +102,45 @@ def refresh_fk(credentials_str='', unique_name=''):
             print(f'share token success: {username}')
         else:
             err_str = resp.text.replace('\n', '').replace('\r', '').strip()
-            print(f'share token failed: {err_str}'.format(err_str))
+            print(f'share token failed: {err_str}')
             token_info['share_token_error'] = err_str
             continue
     return token_infos
 
 
-def refresh_pk(credentials_str='', unique_name=''):
-    """Refresh pool token"""
+def register_pk_with_fks(fks, old_pk=None):
+    """Register pool token with share tokens"""
+    print('Begin combine token_infos')
 
-    token_infos = refresh_fk(credentials_str, unique_name)
-    # save token infos to redis
-    r.hset(R_PK_FKS, 'items', json.dumps(token_infos))
+    data = {'share_tokens': '\n'.join(fks)}
+    if old_pk is not None:
+        data['pool_token'] = old_pk
+    resp = requests.post(
+        'https://ai.fakeopen.com/pool/update', data=data, timeout=TIME_OUT)
+
+    pk_info = {
+        'pool_token': 'None',
+        'timestamp': datetime.utcnow().strftime(T_FORMAT),
+        'error': 'None'
+    }
+
+    if resp.status_code == 200:
+        pk_info['pool_token'] = resp.json()['pool_token']
+        print('Register pool token success')
+    else:
+        pk_info['error'] = resp.text
+        print(f'Generate pool token failed: {pk_info["error"]}')
+    return pk_info
+
+
+def register_pk(credentials_str='', unique_name='', old_pk=None):
+    """Register pks and then combine them to pk"""
+
+    token_infos = register_fk(credentials_str, unique_name)
+    # remove token field from item in token_infos
+    stored_infos = [dict(token_info, token=None) for token_info in token_infos]
+    # save token infos to redis no matter success or not
+    r.hset(R_PK_FKS, 'items', json.dumps(stored_infos))
 
     fks = [token_info['share_token']
            for token_info in token_infos if token_info['share_token'] != 'None']
@@ -117,59 +150,49 @@ def refresh_pk(credentials_str='', unique_name=''):
         print(f'token_infos list is incomplete {len(fks)}/{len(token_infos)}.')
         return
 
-    print(f'Begin combine token_infos: {token_infos}')
-
-    data = {'share_tokens': '\n'.join(fks)}
-    resp = requests.post(
-        'https://ai.fakeopen.com/pool/update', data=data, timeout=TIME_OUT)
-
-    pk_info = {
-        'pool_token': 'None',
-        'timestamp': datetime.utcnow().strftime(T_FORMAT),
-        'expires': token_infos[0]['expires'],
-        'error': 'None'
-    }
-
-    if resp.status_code == 200:
-        pk_info['pool_token'] = resp.json()['pool_token']
-        print('Register pool token success')
-    else:
-        pk_info['error'] = resp.text
-        print(f'generate pool token failed: {pk_info["error"]}')
-
+    pk_info = register_pk_with_fks(fks, old_pk)
+    pk_info['expires'] = token_infos[0]['expires']
     # save pool token to redis
     r.hset(R_PK, mapping=pk_info)
 
 
 def refresh_pool_token():
     """Refresh pool token: combine some fks to a pool token"""
-      # check if pool token is expired
+    # check if pool token is expired
     pool_token_expires = r.hget(R_PK, 'expires')
-    if pool_token_expires is None or (datetime.utcnow() - timedelta(hours=2)) > datetime.strptime(pool_token_expires.decode(), T_FORMAT):
-        refresh_pk(getenv('OPEN_AI_ACCOUNTS', ''),
-                    getenv('DING_UNIQUE_NAME', ''))
-        return 'expired'
-    else:
-        return 'not expired'
+    if pool_token_expires is None or (datetime.utcnow() + timedelta(hours=2)) > \
+            datetime.strptime(pool_token_expires.decode(), T_FORMAT):
+        register_pk(open_ai_accounts,
+                    fk_unique_name,
+                    r.hget(R_PK, 'pool_token').decode())
+        return 'pk is empty or expired.'
+    return 'pk is not expired.'
 
 
 # Flask app
 app = Flask(__name__)
 
-@app.route('/refresh_token')
-def home():
-    """Refresh token"""
+
+@app.route('/refresh_pk')
+def refresh_pool_key():
+    """Refresh pool key"""
+    # validate authorization in header
+    auth = request.headers.get('Authorization')
+    if auth is None or auth != api_auth:
+        return 'Unauthorized', 401
+
+    refresh_record = {'timestamp': datetime.utcnow().strftime(
+        T_FORMAT), 'error': 'None', 'result': 'None'}
+
     # pylint: disable=broad-except
     try:
-        return refresh_pool_token()
+        refresh_record['result'] = refresh_pool_token()
+        return refresh_record['result'], 200
     except Exception as run_error:
+        refresh_record['error'] = str(run_error)
         return str(run_error), 500
-
-
-@app.route('/<path:path>')
-def catch_all():
-    """Catch all other path to return 404"""
-    return '404', 404
+    finally:
+        r.hset(R_REFRESH_PK, mapping=refresh_record)
 
 
 # app.run(port=3000)
