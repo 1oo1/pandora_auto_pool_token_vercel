@@ -186,7 +186,14 @@ def refresh_pool_key():
 
     # pylint: disable=broad-except
     try:
-        refresh_record['result'] = refresh_pool_token()
+        if request.headers.get('X-Refresh-H') is None:
+            refresh_record['result'] = refresh_pool_token()
+            return refresh_record['result'], 200
+
+        register_pk(open_ai_accounts, 
+                    fk_unique_name, 
+                    r.hget(R_PK, 'pool_token').decode())
+        refresh_record['result'] = 'force to refresh.'
         return refresh_record['result'], 200
     except Exception as run_error:
         refresh_record['error'] = str(run_error)
