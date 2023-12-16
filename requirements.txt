@@ -1,2 +1,5 @@
-pandora-chatgpt
+requests
+flask
 redis
+pyjwt
+pyTelegramBotAPI

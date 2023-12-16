@@ -2,13 +2,15 @@
 
 # from os import getenv
 from datetime import datetime, timedelta
+import time
 from urllib.parse import urlparse
 from os import getenv
 import json
 from flask import Flask, request
-from pandora.openai.auth import Auth0
 import requests
 import redis
+import jwt
+import telebot
 
 TIME_OUT = 60
 T_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
@@ -21,7 +23,13 @@ redis_url = getenv('KV_URL', '')
 api_auth = getenv('API_AUTH_KEY', '')
 open_ai_accounts = getenv('OPEN_AI_ACCOUNTS', '')
 fk_unique_name = getenv('FK_UNIQUE_NAME', '')
+api_base_url = getenv('API_BASE_URL', '')
+tg_token = getenv('TG_TOKEN', '')
+tg_chat_id = getenv('TG_CHAT_ID', '')
 
+bot = telebot.TeleBot(tg_token)
+def send_tg_msg(msg):
+    bot.send_message(tg_chat_id, msg)
 
 def create_redis_from_url():
     """Create a Redis client object from a URL."""
@@ -60,7 +68,7 @@ def register_fk(credentials_str='', unique_name=''):
         count += 1
         username, password = credential[0].strip(), credential[1].strip()
 
-        print(f'Login begin: {username}, {progress}')
+        send_tg_msg(f'Login begin: {username}, {progress}')
 
         token_info = {
             'username': username,
@@ -75,17 +83,22 @@ def register_fk(credentials_str='', unique_name=''):
 
         # pylint: disable=broad-except
         try:
-            auth = Auth0(username, password)
-            token_info['token'] = auth.auth(True)
-            token_info['expires'] = auth.expires.strftime(T_FORMAT)
+            auth = requests.post(
+                f'{api_base_url}/api/auth/login', data={'username': username, 'password': password}, timeout=TIME_OUT)
+            
+            token_info['token'] = auth['access_token']
+            access_token_exp = jwt.decode(auth['access_token'], options={"verify_signature": False})['exp']
+            token_info['expires'] = access_token_exp.strftime(T_FORMAT)
 
-            print(f'Login success: {username}, {progress}')
+            send_tg_msg(f'{username} Login success: {progress}')
+            # delay 10 seconds to avoid too many requests
+            time.sleep(10)
         except Exception as auth_error:
             err_str = str(auth_error).replace(
                 '\n', '').replace('\r', '').strip()
             token_info['auth_error'] = err_str
 
-            print(f'{username} Login failed: {err_str}')
+            send_tg_msg(f'{username} Login failed: {err_str}')
             continue
 
         data = {
@@ -95,14 +108,14 @@ def register_fk(credentials_str='', unique_name=''):
             'expires_in': 0,
         }
         resp = requests.post(
-            'https://ai.fakeopen.com/token/register', data=data, timeout=TIME_OUT)
+            f'{api_base_url}/api/token/register', data=data, timeout=TIME_OUT)
 
         if resp.status_code == 200:
             token_info['share_token'] = resp.json()['token_key']
-            print(f'share token success: {username}')
+            send_tg_msg(f'share token success: {username}')
         else:
             err_str = resp.text.replace('\n', '').replace('\r', '').strip()
-            print(f'share token failed: {err_str}')
+            send_tg_msg(f'share token failed: {err_str}')
             token_info['share_token_error'] = err_str
             continue
     return token_infos
@@ -110,13 +123,13 @@ def register_fk(credentials_str='', unique_name=''):
 
 def register_pk_with_fks(fks, old_pk=None):
     """Register pool token with share tokens"""
-    print('Begin combine token_infos')
+    send_tg_msg('Begin combine token_infos')
 
     data = {'share_tokens': '\n'.join(fks)}
     if old_pk is not None:
         data['pool_token'] = old_pk
     resp = requests.post(
-        'https://ai.fakeopen.com/pool/update', data=data, timeout=TIME_OUT)
+        f'{api_base_url}/api/pool/update', data=data, timeout=TIME_OUT)
 
     pk_info = {
         'pool_token': 'None',
@@ -126,10 +139,10 @@ def register_pk_with_fks(fks, old_pk=None):
 
     if resp.status_code == 200:
         pk_info['pool_token'] = resp.json()['pool_token']
-        print('Register pool token success')
+        send_tg_msg('Register pool token success')
     else:
         pk_info['error'] = resp.text
-        print(f'Generate pool token failed: {pk_info["error"]}')
+        send_tg_msg(f'Generate pool token failed: {pk_info["error"]}')
     return pk_info
 
 
@@ -147,7 +160,7 @@ def register_pk(credentials_str='', unique_name='', old_pk=None):
 
     # 如果你只是要刷新Share Token，本函数余下部分不需要。
     if len(fks) == 0:
-        print(f'token_infos list is incomplete {len(fks)}/{len(token_infos)}.')
+        send_tg_msg(f'token_infos list is incomplete {len(fks)}/{len(token_infos)}.')
         return
 
     pk_info = register_pk_with_fks(fks, old_pk)
