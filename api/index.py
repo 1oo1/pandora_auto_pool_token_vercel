@@ -5,8 +5,8 @@ from os import getenv
 from flask import Flask, request
 import jwt
 from telebot import TeleBot
-from tokens import login, register_fk, access_token_by_sk, register_pk
-import storage
+from utils.tokens import login, register_fk, access_token_by_sk, register_pk
+import utils.storage as storage
 
 tg_logs = ""
 
@@ -111,7 +111,7 @@ def refresh():
     try:
         exp = storage.get_pool_token_exp()
         # if pool token is None or timestamp is not expired, return
-        if exp is not None or int(time.time()) < int(exp):
+        if exp is not None and int(time.time()) < exp:
             tg_logs += f"Ignore refresh.\n"
             return 'Not expired', 200
         
